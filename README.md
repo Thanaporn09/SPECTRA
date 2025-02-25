@@ -1,6 +1,10 @@
 # SPECTRA : Slide-based Pathology and gEnomiC daTa for Reporting and Analysis
 This is the official pytorch implementation repository of our SPECTRA : Slide-based Pathology and gEnomiC daTa for Reporting and Analysis.
 
+## SPECTRA Architecture
+<div align="center">
+  <img src="resources/Fig1.png"/>
+</div>
 ## Dataset
 - We have used the following datasets:
   -  Histopathology WSIs (TGCA-BRCA, TGCA-LUAD): Heath, A.P., Ferretti, V., Agrawal, S., An, M., Angelakos, J.C., Arya, R., Bajari, R., Baqar, B., Barnowski, J.H., Burt, J., et al.: The nci genomic data commons. Nature genetics 53(3), 257–262 (2021)
@@ -12,4 +16,3 @@ This is the official pytorch implementation repository of our SPECTRA : Slide-ba
 - pytorch 2.1.1
 - causal-conv1d 1.4.0
 - mamba-ssm 2.2.2
-
