@@ -566,6 +566,10 @@ class BaseGen_SPECTRA(AttModel):
         ])
 
     def _sample(self, fc_feats, att_feats, cnv, att_masks=None, update_opts={}):
+        """
+        If beam_size == 1 => run sampling (greedy/temperature).
+        If beam_size > 1 => run beam search.
+        """
         self.eval()
         with torch.no_grad():
             opt = self.args.__dict__
@@ -578,65 +582,170 @@ class BaseGen_SPECTRA(AttModel):
             output_logsoftmax = opt.get('output_logsoftmax', 1)
             decoding_constraint = opt.get('decoding_constraint', 0)
             block_trigrams = opt.get('block_trigrams', 0)
-
-            # Ensure CNV is on the same device as fc_feats
             cnv = cnv.to(fc_feats.device)
-
-            # 1. Prepare features using _prepare_feature_forward
             att_feats_proc, seq_dummy, att_masks_proc, seq_mask = self._prepare_feature_forward(att_feats, att_masks, None)
-            # 2. Run the full encoder to produce memory and src_mask
             memory, src_mask = self.model.encode(att_feats_proc, att_masks_proc)
-            
-            # 3. Optionally, incorporate CNV features if provided
+
             if cnv is not None:
+                cnv = cnv.to(fc_feats.device)
                 cnv_feature = self.cnv_encoder(cnv)      # [B, d_model]
                 cnv_feature = cnv_feature.unsqueeze(1)   # [B, 1, d_model]
                 cnv_feature = cnv_feature.expand(-1, memory.size(1), -1)  # [B, L, d_model]
                 cross_feature = self.cross_attn(memory, cnv_feature, cnv_feature)
                 memory = memory + cross_feature
 
-            # 4. Initialize state and output tensors
             batch_size = fc_feats.size(0)
-            state = self.init_hidden(batch_size * sample_n)
-            if sample_n > 1:
-                memory, src_mask = utils.repeat_tensors(sample_n, [memory, src_mask])
-            seq = fc_feats.new_full((batch_size * sample_n, self.max_seq_length), self.pad_idx, dtype=torch.long)
-            seqLogprobs = fc_feats.new_zeros(batch_size * sample_n, self.max_seq_length, self.vocab_size + 1)
 
-            # 5. Decoding loop using fixed memory and src_mask
-            for t in range(self.max_seq_length + 1):
-                if t == 0:
-                    it = fc_feats.new_full([batch_size * sample_n], self.bos_idx, dtype=torch.long)
-                logprobs, state = self.get_logprobs_state_with_memory(
-                    it, memory, src_mask, state, output_logsoftmax=output_logsoftmax
-                )
-                if decoding_constraint and t > 0:
-                    tmp = logprobs.new_zeros(logprobs.size())
-                    tmp.scatter_(1, seq[:, t - 1].unsqueeze(1), float('-inf'))
-                    logprobs = logprobs + tmp
-                if block_trigrams and t >= 3:
-                    # Optionally disable trigram blocking for speed.
-                    pass
-                if t == self.max_seq_length:
-                    break
-                it, sampleLogprobs = self.sample_next_word(logprobs, sample_method, temperature)
-                if t == 0:
-                    unfinished = it != self.eos_idx
-                else:
-                    it[~unfinished] = self.pad_idx
-                    logprobs = logprobs * unfinished.unsqueeze(1).float()
-                    unfinished = unfinished & (it != self.eos_idx)
-                seq[:, t] = it
-                seqLogprobs[:, t] = logprobs
-                if unfinished.sum() == 0:
-                    break
-            return seq, seqLogprobs
+            # ---------- Single-sample (beam_size==1) branch ----------
+            if beam_size == 1:
+                state = self.init_hidden(batch_size * sample_n)
+                if sample_n > 1:
+                    memory, src_mask = utils.repeat_tensors(sample_n, [memory, src_mask])
+                seq = fc_feats.new_full((batch_size * sample_n, self.max_seq_length), self.pad_idx, dtype=torch.long)
+                seqLogprobs = fc_feats.new_zeros(batch_size * sample_n, self.max_seq_length, self.vocab_size + 1)
+                unfinished = fc_feats.new_ones(batch_size * sample_n, dtype=torch.bool)
+                for t in range(self.max_seq_length + 1):
+                    if t == 0:
+                        it = fc_feats.new_full([batch_size * sample_n], self.bos_idx, dtype=torch.long)
+                    logprobs, state = self.get_logprobs_state_with_memory(it, memory, src_mask, state,
+                                                                        output_logsoftmax=output_logsoftmax)
+                    if decoding_constraint and t > 0:
+                        tmp = logprobs.new_zeros(logprobs.size())
+                        tmp.scatter_(1, seq[:, t - 1].unsqueeze(1), float('-inf'))
+                        logprobs = logprobs + tmp
+                    if block_trigrams and t >= 3:
+                        pass
+                    if t == self.max_seq_length:
+                        break
+                    it, sampleLogprobs = self.sample_next_word(logprobs, sample_method, temperature)
+                    if t == 0:
+                        unfinished = it != self.eos_idx
+                    else:
+                        it[~unfinished] = self.pad_idx
+                        logprobs = logprobs * unfinished.unsqueeze(1).float()
+                        unfinished = unfinished & (it != self.eos_idx)
+                    seq[:, t] = it
+                    seqLogprobs[:, t] = logprobs
+                    if unfinished.sum() == 0:
+                        break
+                return seq, seqLogprobs
+
+            # ---------- Beam search branch (beam_size > 1) ----------
+            else:
+                seqs = []
+                seqLogprobs_all = []
+                for b in range(batch_size):
+                    mem_b = memory[b:b+1]       # [1, L, d_model]
+                    src_mask_b = src_mask[b:b+1]  # [1, 1, L] or similar
+                    mem_b = mem_b.expand(beam_size, mem_b.size(1), mem_b.size(2)).contiguous()
+                    src_mask_b = src_mask_b.expand(beam_size, src_mask_b.size(1), src_mask_b.size(2)).contiguous()
+
+                    beam_seq = fc_feats.new_full((beam_size, self.max_seq_length), self.pad_idx, dtype=torch.long)
+                    beam_seq_logprobs = fc_feats.new_zeros(beam_size, self.max_seq_length)
+                    beam_logprobs_sum = fc_feats.new_zeros(beam_size)
+                    beam_state = [self.init_hidden(beam_size)]
+                    it = fc_feats.new_full((beam_size,), self.bos_idx, dtype=torch.long)
+                    done_beams = []
+
+                    for t in range(self.max_seq_length):
+                        if t == 0:
+                            logprobs, new_state = self.get_logprobs_state_with_memory(
+                                it, mem_b, src_mask_b, beam_state[-1], output_logsoftmax=output_logsoftmax
+                            )
+                            # At t==0, we only have one real path; pick top tokens from logprobs[0]
+                            topk_logprobs, topk_ids = logprobs[0].topk(beam_size, dim=0)
+                            for k in range(beam_size):
+                                beam_seq[k, t] = topk_ids[k]
+                                beam_seq_logprobs[k, t] = topk_logprobs[k]
+                                beam_logprobs_sum[k] = topk_logprobs[k]
+                            new_state_list = []
+                            for st_item in new_state:
+                                if isinstance(st_item, torch.Tensor):
+                                    # Here st_item shape is [1, beam_size, ...]; we leave dimension 0 intact.
+                                    # For a 4-D tensor: [1, beam_size, seq_len, d_model]
+                                    # For a 3-D tensor: [1, beam_size, d_model]
+                                    new_state_list.append(st_item.clone())
+                                elif isinstance(st_item, list):
+                                    expanded_list = []
+                                    for s in st_item:
+                                        expanded_list.append(s.clone())
+                                    new_state_list.append(expanded_list)
+                                else:
+                                    new_state_list.append(st_item)
+                            beam_state.append(new_state_list)
+                        else:
+                            logprobs, new_state = self.get_logprobs_state_with_memory(
+                                beam_seq[:, t-1], mem_b, src_mask_b, beam_state[-1],
+                                output_logsoftmax=output_logsoftmax
+                            )
+                            cand_logprobs = logprobs + beam_logprobs_sum.unsqueeze(1)
+                            flat_cand_logprobs = cand_logprobs.view(-1)
+                            topk_logprobs, topk_ids = flat_cand_logprobs.topk(beam_size, dim=0)
+                            new_beam_seq = beam_seq.clone()
+                            new_beam_seq_logprobs = beam_seq_logprobs.clone()
+                            new_beam_logprobs_sum = beam_logprobs_sum.clone()
+                            new_beam_state_list = []
+                            for st_item in new_state:
+                                if isinstance(st_item, torch.Tensor):
+                                    new_beam_state_list.append(st_item.clone())
+                                elif isinstance(st_item, list):
+                                    new_list = []
+                                    for s in st_item:
+                                        new_list.append(s.clone())
+                                    new_beam_state_list.append(new_list)
+                                else:
+                                    new_beam_state_list.append(st_item)
+                            vocab_size = logprobs.size(1)
+                            for i, (val, idx) in enumerate(zip(topk_logprobs, topk_ids)):
+                                beam_idx = idx // vocab_size
+                                token_idx = idx % vocab_size
+
+                                new_beam_seq[i, :t] = beam_seq[beam_idx, :t]
+                                new_beam_seq[i, t] = token_idx
+                                new_beam_seq_logprobs[i, :t] = beam_seq_logprobs[beam_idx, :t]
+                                new_beam_seq_logprobs[i, t] = logprobs[beam_idx, token_idx]
+                                new_beam_logprobs_sum[i] = val
+
+                                for j, st_item in enumerate(new_state):
+                                    if isinstance(st_item, torch.Tensor):
+                                        # st_item has shape [1, beam_size, ...]; update beam dimension at index i
+                                        new_beam_state_list[j][0, i] = st_item[0, beam_idx]
+                                    elif isinstance(st_item, list):
+                                        for layer_ix in range(len(st_item)):
+                                            new_beam_state_list[j][layer_ix][0, i] = st_item[layer_ix][0, beam_idx]
+                            beam_seq = new_beam_seq
+                            beam_seq_logprobs = new_beam_seq_logprobs
+                            beam_logprobs_sum = new_beam_logprobs_sum
+                            beam_state[-1] = new_beam_state_list
+
+                        eos_mask = (beam_seq[:, t] == self.eos_idx)
+                        if t == self.max_seq_length - 1:
+                            eos_mask.fill_(1)
+                        for k in range(beam_size):
+                            if eos_mask[k]:
+                                done_beams.append({
+                                    'seq': beam_seq[k].clone(),
+                                    'logprob': beam_logprobs_sum[k].item()
+                                })
+                                beam_logprobs_sum[k] = -9999
+                        if eos_mask.all():
+                            break
+                    if len(done_beams) == 0:
+                        for k in range(beam_size):
+                            done_beams.append({
+                                'seq': beam_seq[k].clone(),
+                                'logprob': beam_logprobs_sum[k].item()
+                            })
+                    done_beams = sorted(done_beams, key=lambda x: -x['logprob'])
+                    best_beam = done_beams[0]
+                    seqs.append(best_beam['seq'].unsqueeze(0))
+                    seq_logprobs_best = fc_feats.new_zeros(self.max_seq_length, dtype=torch.float)
+                    seqLogprobs_all.append(seq_logprobs_best.unsqueeze(0))
+                seq = torch.cat(seqs, dim=0)
+                seqLogprobs = torch.cat(seqLogprobs_all, dim=0)
+                return seq, seqLogprobs
 
     def get_logprobs_state_with_memory(self, it, memory, src_mask, state, output_logsoftmax=1):
-        """
-        Similar to get_logprobs_state but uses a precomputed memory (and src_mask)
-        instead of recomputing the encoder outputs.
-        """
         xt = self.embed(it)
         output, state = self.core_with_memory(xt, memory, src_mask, state)
         if len(output.shape) > 2:
@@ -649,7 +758,7 @@ class BaseGen_SPECTRA(AttModel):
 
     def core_with_memory(self, xt, memory, src_mask, state):
         """
-        A version of core that uses the provided memory and src_mask.
+        The 'core' step of decoding with the provided memory/src_mask.
         """
         if len(state) == 0:
             ys = xt.unsqueeze(1)
