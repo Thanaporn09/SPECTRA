@@ -17,3 +17,4 @@ This is the official pytorch implementation repository of our SPECTRA : Slide-ba
 - pytorch 2.1.1
 - causal-conv1d 1.4.0
 - mamba-ssm 2.2.2
+  
