@@ -3,7 +3,7 @@ This is the official pytorch implementation repository of our SPECTRA : Slide-ba
 
 ## SPECTRA Architecture
 <div align="center">
-  <img src="resource/Fig1.png"/>
+  <img src="resources/Fig1.png"/>
 </div>
 
 ## Dataset
